@@ -1,8 +1,8 @@
+import csv
 import io
 import os
 from datetime import datetime, timezone
 
-import pandas as pd
 from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
@@ -26,11 +26,22 @@ HTML = """
     .badge { display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 12px; }
     .high { background: #ffebee; color: #b71c1c; }
     .medium { background: #fff3e0; color: #e65100; }
+    .steps { margin: 0; padding-left: 18px; }
   </style>
 </head>
 <body>
   <h1>Entra Guest Access Reviewer (MVP)</h1>
   <p>Upload a CSV export of guest users to identify stale access candidates for manual review.</p>
+
+  <div class=\"box\">
+    <h3 style=\"margin-top:0\">How to use (step-by-step)</h3>
+    <ol class=\"steps\">
+      <li>In Microsoft Entra admin center, export your users list as CSV (Users → All users → Download users).</li>
+      <li>Make sure CSV includes these columns (case-sensitive): <code>userPrincipalName</code>, <code>displayName</code>, <code>userType</code>, <code>accountEnabled</code>, <code>lastSignInDateTime</code>.</li>
+      <li>Upload the CSV below and click <b>Analyze</b>.</li>
+      <li>Review flagged guests and confirm actions with app/data owners before disabling or removing access.</li>
+    </ol>
+  </div>
 
   <div class=\"box note\">
     <strong>Security disclaimer (MVP):</strong>
@@ -48,6 +59,10 @@ HTML = """
       <button type=\"submit\">Analyze</button>
     </form>
   </div>
+
+  {% if error %}
+  <div class=\"box\" style=\"border-color:#f44336;background:#ffebee\">{{ error }}</div>
+  {% endif %}
 
   {% if summary %}
   <div class=\"box\">
@@ -82,13 +97,30 @@ HTML = """
 """
 
 
-def _to_days(v):
-    if pd.isna(v):
+REQUIRED_COLS = ["displayName", "userPrincipalName", "userType", "accountEnabled", "lastSignInDateTime"]
+
+
+def _to_days(value: str | None):
+    if not value:
         return None
-    ts = pd.to_datetime(v, utc=True, errors="coerce")
-    if pd.isna(ts):
+    try:
+        v = value.strip().replace("Z", "+00:00")
+        ts = datetime.fromisoformat(v)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return int((datetime.now(timezone.utc) - ts.astimezone(timezone.utc)).days)
+    except Exception:
         return None
-    return int((datetime.now(timezone.utc) - ts.to_pydatetime()).days)
+
+
+def _classify(days):
+    if days is None:
+        return ("Medium", "Manual review: no sign-in timestamp")
+    if days >= 180:
+        return ("High", "Candidate to disable/remove after owner confirmation")
+    if days >= 90:
+        return ("Medium", "Send owner attestation request")
+    return (None, None)
 
 
 @app.get("/health")
@@ -99,47 +131,62 @@ def health():
 @app.route("/", methods=["GET", "POST"])
 def index():
     if request.method == "GET":
-        return render_template_string(HTML, summary=None, rows=[])
+        return render_template_string(HTML, summary=None, rows=[], error=None)
 
     f = request.files.get("file")
     if not f:
-        return render_template_string(HTML, summary=None, rows=[])
+        return render_template_string(HTML, summary=None, rows=[], error="Please upload a CSV file.")
 
-    raw = f.read()
-    df = pd.read_csv(io.BytesIO(raw))
+    try:
+        text = f.read().decode("utf-8", errors="ignore")
+        reader = csv.DictReader(io.StringIO(text))
+        if not reader.fieldnames:
+            return render_template_string(HTML, summary=None, rows=[], error="Invalid CSV: missing header row.")
 
-    # Normalize expected schema
-    for col in ["displayName", "userPrincipalName", "userType", "accountEnabled", "lastSignInDateTime"]:
-        if col not in df.columns:
-            df[col] = None
+        # normalize missing columns by adding empty values per row
+        rows = []
+        for r in reader:
+            row = {k: (r.get(k) or "") for k in set(REQUIRED_COLS + list(r.keys()))}
+            rows.append(row)
 
-    guests = df[df["userType"].astype(str).str.lower() == "guest"].copy()
-    guests["days_since_signin"] = guests["lastSignInDateTime"].apply(_to_days)
+        guests = [r for r in rows if str(r.get("userType", "")).strip().lower() == "guest"]
 
-    def classify(days):
-        if days is None:
-            return ("Medium", "Manual review: no sign-in timestamp")
-        if days >= 180:
-            return ("High", "Candidate to disable/remove after owner confirmation")
-        if days >= 90:
-            return ("Medium", "Send owner attestation request")
-        return (None, None)
+        flagged = []
+        stale_90 = 0
+        stale_180 = 0
 
-    priorities = guests["days_since_signin"].apply(classify)
-    guests["priority"] = priorities.apply(lambda x: x[0])
-    guests["action"] = priorities.apply(lambda x: x[1])
+        for g in guests:
+            days = _to_days(g.get("lastSignInDateTime"))
+            if days is not None and days >= 90:
+                stale_90 += 1
+            if days is not None and days >= 180:
+                stale_180 += 1
 
-    flagged = guests[guests["priority"].notna()].copy()
-    flagged = flagged.sort_values(by=["priority", "days_since_signin"], ascending=[True, False], na_position="last")
+            priority, action = _classify(days)
+            if priority:
+                flagged.append(
+                    {
+                        "displayName": g.get("displayName") or "N/A",
+                        "userPrincipalName": g.get("userPrincipalName") or "N/A",
+                        "days_since_signin": days if days is not None else "N/A",
+                        "priority": priority,
+                        "action": action,
+                    }
+                )
 
-    summary = {
-        "total_guests": int(len(guests)),
-        "stale_90": int((guests["days_since_signin"].fillna(-1) >= 90).sum()),
-        "stale_180": int((guests["days_since_signin"].fillna(-1) >= 180).sum()),
-    }
+        priority_rank = {"High": 0, "Medium": 1}
+        flagged.sort(key=lambda x: (priority_rank.get(x["priority"], 9), -(x["days_since_signin"] if isinstance(x["days_since_signin"], int) else -1)))
 
-    rows = flagged[["displayName", "userPrincipalName", "days_since_signin", "priority", "action"]].fillna("N/A").to_dict("records")
-    return render_template_string(HTML, summary=summary, rows=rows)
+        summary = {
+            "total_guests": len(guests),
+            "stale_90": stale_90,
+            "stale_180": stale_180,
+        }
+
+        return render_template_string(HTML, summary=summary, rows=flagged, error=None)
+
+    except Exception as e:
+        return render_template_string(HTML, summary=None, rows=[], error=f"CSV processing error: {e}")
 
 
 if __name__ == "__main__":
